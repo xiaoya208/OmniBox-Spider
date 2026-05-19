@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持，滑块验证：支持
 // @dependencies: axios, cheerio, crypto
-// @version 1.1.0
+// @version 1.2.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/TVB云播.js
 
 
@@ -47,7 +47,47 @@ const axiosInstance = axios.create({
   httpAgent: new http.Agent({ keepAlive: true }),
 });
 
-const VERIFY_STORE = { cookie: "" };
+const VERIFY_STORE = { cookie: "", verifiedAt: 0 };
+const VERIFY_CACHE_KEY = "tvbyb:verify-cookie";
+const VERIFY_TTL_MS = 30 * 60 * 1000;
+
+async function loadVerifyCache() {
+  if (VERIFY_STORE.cookie && Date.now() - VERIFY_STORE.verifiedAt < VERIFY_TTL_MS) {
+    return true;
+  }
+  try {
+    const cached = await OmniBox.getCache(VERIFY_CACHE_KEY);
+    if (!cached) return false;
+    const parsed = typeof cached === "string" ? JSON.parse(cached) : cached;
+    const cookie = String(parsed?.cookie || "").trim();
+    const verifiedAt = Number(parsed?.verifiedAt || 0);
+    if (cookie && Date.now() - verifiedAt < VERIFY_TTL_MS) {
+      VERIFY_STORE.cookie = cookie;
+      VERIFY_STORE.verifiedAt = verifiedAt;
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+async function saveVerifyCache() {
+  VERIFY_STORE.verifiedAt = Date.now();
+  try {
+    await OmniBox.setCache(
+      VERIFY_CACHE_KEY,
+      JSON.stringify({ cookie: VERIFY_STORE.cookie, verifiedAt: VERIFY_STORE.verifiedAt }),
+      Math.ceil(VERIFY_TTL_MS / 1000)
+    );
+  } catch (_) {}
+}
+
+async function clearVerifyCache() {
+  VERIFY_STORE.cookie = "";
+  VERIFY_STORE.verifiedAt = 0;
+  try {
+    await OmniBox.setCache(VERIFY_CACHE_KEY, JSON.stringify({ cookie: "", verifiedAt: 0 }), 1);
+  } catch (_) {}
+}
 
 function md5(text) {
   return crypto.createHash("md5").update(String(text || ""), "utf8").digest("hex");
@@ -135,17 +175,37 @@ async function passSliderVerify(html) {
 }
 
 async function requestWithVerify(url, options = {}) {
+  await loadVerifyCache();
   const headers = { ...DEFAULT_HEADERS, ...(options.headers || {}) };
   if (VERIFY_STORE.cookie) headers.Cookie = VERIFY_STORE.cookie;
   let res = await axiosInstance.get(url, { ...options, headers });
   VERIFY_STORE.cookie = mergeCookie(VERIFY_STORE.cookie, res.headers && res.headers["set-cookie"]);
 
-  if (res.status === 403 || isVerifyPage(res.data)) {
+  if (!VERIFY_STORE.verifiedAt && (res.status === 403 || isVerifyPage(res.data))) {
     const ok = await passSliderVerify(res.data);
     if (ok) {
+      await saveVerifyCache();
       const retryHeaders = { ...headers, Cookie: VERIFY_STORE.cookie };
       res = await axiosInstance.get(url, { ...options, headers: retryHeaders });
       VERIFY_STORE.cookie = mergeCookie(VERIFY_STORE.cookie, res.headers && res.headers["set-cookie"]);
+      if (res.status === 403 || isVerifyPage(res.data)) {
+        await clearVerifyCache();
+      }
+    } else {
+      await clearVerifyCache();
+    }
+  } else if (VERIFY_STORE.verifiedAt && (res.status === 403 || isVerifyPage(res.data))) {
+    await clearVerifyCache();
+    const retryHeaders = { ...DEFAULT_HEADERS, ...(options.headers || {}) };
+    const ok = await passSliderVerify(res.data);
+    if (ok) {
+      await saveVerifyCache();
+      retryHeaders.Cookie = VERIFY_STORE.cookie;
+      res = await axiosInstance.get(url, { ...options, headers: retryHeaders });
+      VERIFY_STORE.cookie = mergeCookie(VERIFY_STORE.cookie, res.headers && res.headers["set-cookie"]);
+      if (res.status === 403 || isVerifyPage(res.data)) {
+        await clearVerifyCache();
+      }
     }
   }
   return res;
